@@ -5,9 +5,10 @@ import (
 	"net/http"
 	"net/rpc"
 	"time"
+	"sync"
 )
 
-var views *ViewService 
+var views *ViewService
 
 type PingInfo struct {
 	Num int
@@ -21,6 +22,7 @@ type View struct {
 	Ack     bool
 	PLast   time.Time
 	BLast   time.Time
+	mu		sync.RWMutex
 }
 
 const (
@@ -28,18 +30,31 @@ const (
 )
 
 func (v View) ViewOutOfDate() bool {
-	if time.Now().Sub(v.PLast) > DEADPING || time.Now().Sub(v.BLast) > DEADPING {
+	if ((v.Primary != "") && time.Now().Sub(v.PLast) > DEADPING) || ((v.Backup != "") && time.Now().Sub(v.BLast) > DEADPING) {
 		return true
 	}
 	return false
 }
 
 func (v View) String() string {
-	return fmt.Sprintf("View #: %d, Primary: %s, Backup: %s", v.Num, v.Primary, v.Backup)
+	return fmt.Sprintf("View #: %d, Primary: %s, Backup: %s, Ack: %v", v.Num, v.Primary, v.Backup, v.Ack)
+}
+
+func (v *View) SetPrimary(id string) {
+	v.Primary = id
+	v.PLast = time.Now()
+	v.Num += 1
+}
+
+func (v *View) SetBackup(id string) {
+	v.Num += 1
+	v.Backup = id
+	v.BLast = time.Now()
 }
 
 type ViewService struct {
 	curView View
+	pServer string
 }
 
 func GetView() View {
@@ -47,32 +62,43 @@ func GetView() View {
 }
 
 func (v *ViewService) Ping(args *PingInfo, reply *View) error {
-	fmt.Println(args.Id, args.Num)
-	if v.curView.Num != 0 && args.Num == v.curView.Num {
-		if args.Id == v.curView.Primary {
-			v.curView.Ack = true
-			v.curView.PLast = time.Now()
-		} else if args.Id == v.curView.Backup {
-			v.curView.BLast = time.Now()
-		}
-	} else if v.curView.Primary == "" {
-		v.curView.Ack = false
-		v.curView.Num = v.curView.Num + 1
-		v.curView.Primary = args.Id
-		v.curView.PLast = time.Now()
-	} else if v.curView.Backup == "" {
-		if v.curView.Ack {
-			v.curView.Backup = args.Id
-			v.curView.Num = v.curView.Num + 1
-			v.curView.BLast = time.Now()
-		}
+	if v.curView.Num == 0 {
+		v.curView.SetPrimary(args.Id)
+		*reply = v.curView
+		return nil
 	}
-	*reply = v.curView
+
+	if args.Id == v.curView.Primary {
+		v.curView.Ack = true
+		v.curView.PLast = time.Now()
+		if v.pServer != "" && (v.curView.Backup == "") {
+			v.curView.SetBackup(v.pServer)
+			v.pServer = ""
+		}
+		*reply = v.curView
+		return nil
+	}
+
+	if args.Id == v.curView.Backup {
+		v.curView.BLast = time.Now()
+		*reply = v.curView
+		return nil
+	}
+
+	if v.curView.Backup == "" && v.curView.Ack {
+		v.curView.SetBackup(args.Id)
+		*reply = v.curView
+	} else {
+		v.pServer = args.Id
+		*reply = v.curView
+
+	}
+
 	return nil
 }
 
 func StartViewService() {
-	views =	&ViewService{curView: View{Num: 0, Primary: "", Backup: "", Ack: false, PLast: time.Now(), BLast: time.Now()}}
+	views = &ViewService{curView: View{Num: 0, Primary: "", Backup: "", Ack: false, PLast: time.Now(), BLast: time.Now()}}
 	go func() {
 		rpc.Register(views)
 		rpc.HandleHTTP()
@@ -86,23 +112,42 @@ func StartViewService() {
 }
 
 func (v *ViewService) update() {
-	if !v.curView.ViewOutOfDate() {
-		return
-	}
+	for {
+		if !v.curView.ViewOutOfDate() {
+			continue
+		}
+		v.curView.mu.Lock()
+		
+		if time.Now().Sub(v.curView.PLast) > DEADPING {
+			v.curView.Primary = ""
+			v.curView.PLast = time.Now()
+		}
 
-	if time.Now().Sub(v.curView.PLast) > DEADPING {
-		v.curView.Primary = ""
-		v.curView.PLast = time.Now()
-	}
+		if time.Now().Sub(v.curView.BLast) > DEADPING {
+			v.curView.Backup = ""
+			v.curView.BLast = time.Now()
+		} else {
+			v.curView.Primary = v.curView.Backup
+			v.curView.Backup = ""
+			v.curView.Ack = false
+			v.curView.BLast = time.Now()
+			v.curView.PLast = time.Now()
+		}
 
-	if time.Now().Sub(v.curView.BLast) > DEADPING {
-		v.curView.Backup = ""
-		v.curView.BLast = time.Now()
-	} else {
-		v.curView.Primary = v.curView.Backup
-		v.curView.Backup = ""
-		v.curView.Ack = false
-		v.curView.BLast = time.Now()
-		v.curView.PLast = time.Now()
+		if v.pServer != "" {
+			if v.curView.Primary == "" {
+				v.curView.Primary = v.pServer
+				v.curView.Ack = false
+				v.curView.PLast = time.Now()
+			} else if v.curView.Backup == "" {
+				v.curView.Backup = v.pServer
+				v.curView.BLast = time.Now()
+			}
+			v.pServer = ""
+		}
+		v.curView.Num += 1
+		v.curView.mu.Unlock()
+		fmt.Println("Update done")
+		fmt.Println(v.curView)
 	}
 }
