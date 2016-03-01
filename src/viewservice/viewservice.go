@@ -97,12 +97,12 @@ func (v *ViewService) Ping(args *PingInfo, reply *View) error {
 	return nil
 }
 
-func StartViewService() {
+func StartViewService(addr string) {
 	views = &ViewService{curView: View{Num: 0, Primary: "", Backup: "", Ack: false, PLast: time.Now(), BLast: time.Now()}}
 	go func() {
 		rpc.Register(views)
 		rpc.HandleHTTP()
-		err := http.ListenAndServe(":1234", nil)
+		err := http.ListenAndServe(addr, nil)
 		if err != nil {
 			fmt.Println(err.Error())
 		}
